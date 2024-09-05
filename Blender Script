@@ -1,0 +1,264 @@
+import bpy
+import os
+import json
+
+# Global properties to store the user's chosen directory path
+class MaterialSyncProperties(bpy.types.PropertyGroup):
+    folder_path: bpy.props.StringProperty(
+        name="Folder Path",
+        description="Choose a directory to save material JSON files",
+        default="",
+        maxlen=1024,
+        subtype='DIR_PATH'
+    )
+
+# Helper function to convert non-serializable data types
+def convert_to_serializable(value):
+    if isinstance(value, (int, float, str)):
+        return value
+    elif hasattr(value, "__iter__"):  # If it's an iterable (e.g., list, tuple)
+        return list(value)
+    elif hasattr(value, "to_list"):  # bpy_prop_array has a to_list() method
+        return value.to_list()
+    else:
+        return str(value)  # Fallback: Convert to string
+
+# Helper function to bake the material to a texture
+def bake_texture(material, bake_type, folder_path, suffix):
+    print(f"Baking texture for material: {material.name}, type: {bake_type}")
+
+    # Set up a new image for baking
+    texture_folder_path = os.path.join(folder_path, 'Textures', material.name)
+    if not os.path.exists(texture_folder_path):
+        os.makedirs(texture_folder_path)
+    
+    bake_image = bpy.data.images.new(name=f"{material.name}_{suffix}_Bake", width=1024, height=1024, alpha=False)
+    texture_node = material.node_tree.nodes.new('ShaderNodeTexImage')
+    texture_node.image = bake_image
+    texture_node.select = True
+    material.node_tree.nodes.active = texture_node
+    
+    # Set the active object and material
+    obj = bpy.context.active_object
+    bpy.context.view_layer.objects.active = obj
+    
+    # Ensure the object has a UV map
+    if not obj.data.uv_layers:
+        bpy.ops.object.mode_set(mode='EDIT')
+        bpy.ops.uv.smart_project()
+        bpy.ops.object.mode_set(mode='OBJECT')
+    
+    # Set bake settings
+    bpy.context.scene.render.engine = 'CYCLES'
+
+    # Set up the baking type
+    if bake_type == "DIFFUSE":
+        bpy.context.scene.cycles.bake_type = 'DIFFUSE'
+        bpy.context.scene.render.bake.use_pass_direct = False
+        bpy.context.scene.render.bake.use_pass_indirect = False
+        bpy.context.scene.render.bake.use_pass_color = True
+    elif bake_type == "ROUGHNESS":
+        bpy.context.scene.cycles.bake_type = 'ROUGHNESS'
+    elif bake_type == "NORMAL":
+        bpy.context.scene.cycles.bake_type = 'NORMAL'
+    else:
+        print(f"Unsupported bake type: {bake_type}")
+        return None
+
+    # Bake and save the texture
+    try:
+        bpy.ops.object.bake(type=bpy.context.scene.cycles.bake_type)
+        print(f"Baking completed for {material.name} ({bake_type})")
+        # Save the baked image
+        texture_path = os.path.join(texture_folder_path, f"{material.name}_{suffix}.png")
+        bake_image.filepath_raw = texture_path
+        bake_image.save()
+        print(f"Texture saved to: {texture_path}")
+    except Exception as e:
+        print(f"Failed to bake texture: {e}")
+        texture_path = None
+
+    # Clean up nodes
+    material.node_tree.nodes.remove(texture_node)
+    bpy.data.images.remove(bake_image)
+
+    return texture_path
+
+# Function to delete disconnected texture files
+def delete_disconnected_texture(material_name, folder_path, suffix):
+    texture_folder_path = os.path.join(folder_path, 'Textures', material_name)
+    texture_path = os.path.join(texture_folder_path, f"{material_name}_{suffix}.png")
+    if os.path.exists(texture_path):
+        os.remove(texture_path)
+        print(f"Deleted disconnected texture: {texture_path}")
+
+# Function to gather material information and return it as a dictionary
+def collect_material_info(material, folder_path):
+    material_info = {
+        'name': material.name,
+        'nodes': []
+    }
+    for node in material.node_tree.nodes:
+        node_info = {
+            'name': node.name,
+            'type': node.type,
+            'inputs': {}
+        }
+        for input in node.inputs:
+            suffix = None
+            if input.name == "Base Color":
+                suffix = "DIFFUSE"
+            elif input.name == "Roughness":
+                suffix = "ROUGHNESS"
+            elif input.name == "Normal":
+                suffix = "NORMAL"
+
+            if suffix:
+                if input.is_linked:
+                    texture_path = bake_texture(material, suffix, folder_path, suffix)
+                    node_info['inputs'][input.name] = texture_path
+                else:
+                    delete_disconnected_texture(material.name, folder_path, suffix)
+                    if hasattr(input, 'default_value'):
+                        node_info['inputs'][input.name] = convert_to_serializable(input.default_value)
+                    else:
+                        node_info['inputs'][input.name] = "No default value"
+            else:
+                if hasattr(input, 'default_value'):
+                    node_info['inputs'][input.name] = convert_to_serializable(input.default_value)
+                else:
+                    node_info['inputs'][input.name] = "No default value"
+        material_info['nodes'].append(node_info)
+    return material_info
+
+# Function to export material information to a JSON file
+def export_material_info(material, folder_path):
+    material_info = collect_material_info(material, folder_path)
+    if not os.path.exists(folder_path):
+        os.makedirs(folder_path)
+    file_path = os.path.join(folder_path, f"{material.name}_material.json")
+    with open(file_path, 'w', encoding="utf-8") as f:
+        json.dump(material_info, f, indent=4)
+    print(f"Material info exported to {file_path}")
+    return file_path
+
+# Function to update the material record file
+def update_material_info(material, file_path, folder_path):
+    new_info = collect_material_info(material, folder_path)
+    with open(file_path, 'w', encoding="utf-8") as f:
+        json.dump(new_info, f, indent=4)
+    print(f"Material info updated at {file_path}")
+
+# Function to check if the material has changed
+def has_material_changed(material, file_path, folder_path):
+    new_info = collect_material_info(material, folder_path)
+    try:
+        with open(file_path, 'r', encoding="utf-8") as f:
+            existing_info = json.load(f)
+    except FileNotFoundError:
+        return True
+    return new_info != existing_info
+
+# Function to sync the material
+def sync_material(context):
+    # Disable depsgraph update handler
+    unregister_depsgraph_handler()
+
+    material = context.object.active_material
+    folder_path = context.scene.material_sync_props.folder_path
+    if material and folder_path:
+        file_path = os.path.join(folder_path, f"{material.name}_material.json")
+        if not os.path.exists(file_path):
+            export_material_info(material, folder_path)
+        else:
+            if has_material_changed(material, file_path, folder_path):
+                update_material_info(material, file_path, folder_path)
+    
+    # Re-enable depsgraph update handler
+    register_depsgraph_handler()
+
+# Function to stop syncing and delete the material record file
+def stop_sync(material, folder_path):
+    # Delete material JSON file
+    file_path = os.path.join(folder_path, f"{material.name}_material.json")
+    if os.path.exists(file_path):
+        os.remove(file_path)
+        print(f"Material note file {file_path} deleted.")
+    
+    # Delete related texture files
+    for suffix in ["DIFFUSE", "ROUGHNESS", "NORMAL"]:
+        delete_disconnected_texture(material.name, folder_path, suffix)
+    
+    # Unregister depsgraph update handler
+    unregister_depsgraph_handler()
+
+# Handler for depsgraph updates
+def depsgraph_update_handler(scene, depsgraph):
+    for update in depsgraph.updates:
+        if isinstance(update.id, bpy.types.Material):
+            material = update.id
+            sync_material(bpy.context)
+
+# Register the depsgraph update handler
+def register_depsgraph_handler():
+    if depsgraph_update_handler not in bpy.app.handlers.depsgraph_update_post:
+        bpy.app.handlers.depsgraph_update_post.append(depsgraph_update_handler)
+
+# Unregister the depsgraph update handler
+def unregister_depsgraph_handler():
+    if depsgraph_update_handler in bpy.app.handlers.depsgraph_update_post:
+        bpy.app.handlers.depsgraph_update_post.remove(depsgraph_update_handler)
+
+# Operator: Sync material to UE and start depsgraph listening
+class SyncMaterialOperator(bpy.types.Operator):
+    bl_idname = "material.sync_to_ue"
+    bl_label = "Sync Material to UE"
+
+    def execute(self, context):
+        sync_material(context)
+        register_depsgraph_handler()
+        return {'FINISHED'}
+
+# Operator: Stop syncing
+class StopSyncOperator(bpy.types.Operator):
+    bl_idname = "material.stop_sync"
+    bl_label = "Stop Sync"
+
+    def execute(self, context):
+        material = context.object.active_material
+        folder_path = context.scene.material_sync_props.folder_path
+        if material and folder_path:
+            stop_sync(material, folder_path)
+        return {'FINISHED'}
+
+# Custom Panel UI
+class SyncMaterialPanel(bpy.types.Panel):
+    bl_label = "Sync Material"
+    bl_idname = "MATERIAL_PT_sync"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = 'MatSyncToUE'
+
+    def draw(self, context):
+        layout = self.layout
+        layout.prop(context.scene.material_sync_props, "folder_path")
+        layout.operator("material.sync_to_ue", text="Sync Material")
+        layout.operator("material.stop_sync", text="Stop Sync")
+
+def register():
+    bpy.utils.register_class(MaterialSyncProperties)
+    bpy.types.Scene.material_sync_props = bpy.props.PointerProperty(type=MaterialSyncProperties)
+    bpy.utils.register_class(SyncMaterialOperator)
+    bpy.utils.register_class(StopSyncOperator)
+    bpy.utils.register_class(SyncMaterialPanel)
+
+def unregister():
+    bpy.utils.unregister_class(MaterialSyncProperties)
+    del bpy.types.Scene.material_sync_props
+    bpy.utils.unregister_class(SyncMaterialOperator)
+    bpy.utils.unregister_class(StopSyncOperator)
+    bpy.utils.unregister_class(SyncMaterialPanel)
+    unregister_depsgraph_handler()
+
+if __name__ == "__main__":
+    register()
