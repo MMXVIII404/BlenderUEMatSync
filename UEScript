@@ -1,0 +1,156 @@
+import unreal
+import os
+import shutil
+import json
+
+# Set the directory path for JSON files
+json_directory_path = r"D:\LearnGold\BlenderMaterialSync"
+textures_project_path = "/Game/Textures"  # Path for textures in Unreal project
+local_textures_path = os.path.join(json_directory_path, "Textures")  # Local path for textures
+
+# Get asset tools and material editing library
+asset_tools = unreal.AssetToolsHelpers.get_asset_tools()
+material_editing_library = unreal.MaterialEditingLibrary
+
+# Function: Remove existing expression nodes
+def remove_existing_expression(material, material_property):
+    try:
+        existing_expression = material_editing_library.get_material_property_input_node(material, material_property)
+        if existing_expression:
+            material.node_tree.nodes.remove(existing_expression)
+            print(f"Removed existing expression node: {existing_expression.get_name()}")
+    except Exception as e:
+        print(f"Failed to remove existing expression node: {str(e)}")
+
+# Function: Create or get a texture sample node
+def create_or_get_texture_sample(material, texture_asset):
+    texture_expression = material_editing_library.create_material_expression(material, unreal.MaterialExpressionTextureSample, -400, 0)
+    texture_expression.set_editor_property('texture', texture_asset)
+    print(f"Created texture sample node for texture: {texture_asset.get_name()}")
+    return texture_expression
+
+# Function: Update or create a texture sample node and connect it to a material property
+def update_or_create_texture_expression(material, texture_asset, material_property):
+    if not is_texture_connected(material, material_property, texture_asset):
+        # If the current node is not connected to the correct texture, remove the old node and create a new one
+        remove_existing_expression(material, material_property)
+        texture_expression = create_or_get_texture_sample(material, texture_asset)
+        if texture_expression:
+            material_editing_library.connect_material_property(texture_expression, "", material_property)
+            print(f"Connected texture {texture_asset.get_name()} to material property: {material_property}")
+
+# Function: Check if the material node is already connected to the correct texture
+def is_texture_connected(material, material_property, texture_asset):
+    connected_expression = material_editing_library.get_material_property_input_node(material, material_property)
+    if connected_expression and isinstance(connected_expression, unreal.MaterialExpressionTextureSample):
+        connected_texture = connected_expression.texture
+        if connected_texture == texture_asset:
+            print(f"Material node is already connected to the correct texture: {connected_texture.get_name()}")
+            return True
+    return False
+
+# Function: Unload and delete the old uasset file
+def delete_old_uasset(texture_asset_path):
+    if unreal.EditorAssetLibrary.does_asset_exist(texture_asset_path):
+        # Unload the asset to ensure the file is not locked
+        unreal.EditorAssetLibrary.unload_asset(texture_asset_path)
+        # Delete the uasset file
+        success = unreal.EditorAssetLibrary.delete_asset(texture_asset_path)
+        if success:
+            print(f"Successfully deleted old uasset file: {texture_asset_path}")
+        else:
+            print(f"Failed to delete old uasset file: {texture_asset_path}")
+
+# Function: Check if the texture needs to be updated
+def texture_needs_update(local_texture_path, texture_asset):
+    local_texture_time = os.path.getmtime(local_texture_path)
+
+    if texture_asset:
+        asset_data = unreal.EditorAssetLibrary.find_asset_data(texture_asset.get_path_name())
+        unreal_asset_time = asset_data.get_tag_value("DateModified")
+        if unreal_asset_time:
+            unreal_asset_time = float(unreal_asset_time)
+            return local_texture_time > unreal_asset_time
+
+    return True
+
+# Function: Import texture into Unreal Engine
+def import_texture(texture_path, destination_path):
+    factory = unreal.TextureFactory()
+    asset_import_task = unreal.AssetImportTask()
+    
+    asset_import_task.set_editor_property('filename', texture_path)
+    asset_import_task.set_editor_property('destination_path', destination_path)
+    asset_import_task.set_editor_property('factory', factory)
+    asset_import_task.set_editor_property('automated', True)
+    asset_import_task.set_editor_property('save', True)
+    
+    unreal.AssetToolsHelpers.get_asset_tools().import_asset_tasks([asset_import_task])
+
+    # Force refresh the asset registry to ensure the newly imported asset is visible
+    unreal.AssetRegistryHelpers.get_asset_registry().scan_paths_synchronous([destination_path])
+
+    # Load the imported texture asset
+    texture_name = os.path.splitext(os.path.basename(texture_path))[0]
+    texture_asset_path = f"{destination_path}/{texture_name}"
+    texture_asset = unreal.EditorAssetLibrary.load_asset(texture_asset_path)
+    
+    if texture_asset:
+        print(f"Successfully loaded texture asset: {texture_asset.get_path_name()}")
+    else:
+        print(f"Failed to load texture asset: {texture_asset_path}")
+    
+    return texture_asset
+
+# Traverse the directory and find all material JSON files
+for file_name in os.listdir(json_directory_path):
+    if file_name.endswith('_material.json'):
+        file_path = os.path.join(json_directory_path, file_name)
+        
+        # Read data from the JSON file
+        with open(file_path, 'r', encoding="utf-8") as f:
+            material_data = json.load(f)
+        
+        # Extract the material name
+        material_name = material_data['name']
+        material_asset_path = f"/Game/Materials/{material_name}"
+
+        if not unreal.EditorAssetLibrary.does_asset_exist(material_asset_path):
+            material = asset_tools.create_asset(material_name, "/Game/Materials", unreal.Material, unreal.MaterialFactoryNew())
+            print(f"Created new material: {material_name}")
+        else:
+            material = unreal.EditorAssetLibrary.load_asset(material_asset_path)
+            print(f"Loaded existing material: {material_name}")
+
+        if material is not None:
+            texture_folder = os.path.join(local_textures_path, material_name)
+            if os.path.exists(texture_folder):
+                for texture_file in os.listdir(texture_folder):
+                    texture_file_path = os.path.join(texture_folder, texture_file)
+                    texture_name, ext = os.path.splitext(texture_file)
+                    
+                    if ext.lower() in ['.png', '.jpg', '.tga']:
+                        project_texture_folder = f"{textures_project_path}/{material_name}"
+                        destination_path = f"{project_texture_folder}/{os.path.basename(texture_file)}"
+
+                        os.makedirs(unreal.Paths.convert_relative_path_to_full(unreal.Paths.project_content_dir()) + f"/Textures/{material_name}", exist_ok=True)
+
+                        texture_asset = unreal.EditorAssetLibrary.load_asset(destination_path)
+
+                        if texture_needs_update(texture_file_path, texture_asset):
+                            delete_old_uasset(destination_path)
+                            shutil.copy(texture_file_path, unreal.Paths.convert_relative_path_to_full(unreal.Paths.project_content_dir()) + f"/Textures/{material_name}/{texture_file}")
+                            texture_asset = import_texture(texture_file_path, project_texture_folder)
+
+                        if texture_asset:
+                            if "diffuse" in texture_name.lower():
+                                update_or_create_texture_expression(material, texture_asset, unreal.MaterialProperty.MP_BASE_COLOR)
+                            elif "roughness" in texture_name.lower():
+                                update_or_create_texture_expression(material, texture_asset, unreal.MaterialProperty.MP_ROUGHNESS)
+                            elif "normal" in texture_name.lower():
+                                update_or_create_texture_expression(material, texture_asset, unreal.MaterialProperty.MP_NORMAL)
+
+            unreal.EditorAssetLibrary.save_asset(material.get_path_name())
+            print(f"Saved material: {material_name}")
+        else:
+            print(f"Failed to create or load material: {material_name}")
